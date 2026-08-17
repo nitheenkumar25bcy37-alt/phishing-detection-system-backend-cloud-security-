@@ -1,69 +1,73 @@
-# backend/modules/ml_engine/predictor.py
 import os
 import joblib
 import pandas as pd
+import shap
+import numpy as np
 
 class MLPredictor:
     def __init__(self):
-        # Load the saved model into memory once when the class is initialized
         current_dir = os.path.dirname(__file__)
-        model_path = os.path.join(current_dir, "rf_model.pkl")
-        
+        model_path = os.path.join(current_dir, "xgb_model.pkl") 
         try:
             self.model = joblib.load(model_path)
-        except FileNotFoundError:
-            print(f"Error: Model not found at {model_path}. Please run trainer.py first.")
+            # Initialize the SHAP explainer on the trained model
+            self.explainer = shap.TreeExplainer(self.model)
+        except Exception as e:
+            print(f"Model load error: {e}")
             self.model = None
+            self.explainer = None
 
-    def predict(self, url_length: int, has_ip: int, suspicious_tld: int, 
-                password_fields: int, hidden_iframes: int, external_action: int) -> dict:
-        """
-        Takes live features and returns a phishing probability score (0.0 to 1.0).
-        """
-        if self.model is None:
-            return {"ml_score": 0.0, "risk": "LOW", "indicators": ["ml_model_missing"]}
+    def predict(self, url_length, has_ip, suspicious_tld, password_fields, hidden_iframes, external_action):
+        if self.model is None or self.explainer is None: 
+            return {"ml_score": 0.0, "risk": "LOW", "indicators": []}
 
-        # 1. Format the live data exactly how the model expects it
-        features = pd.DataFrame([[
-            url_length, 
-            has_ip, 
-            suspicious_tld, 
-            password_fields, 
-            hidden_iframes, 
-            external_action
-        ]], columns=[
-            'url_length', 'has_ip', 'suspicious_tld', 
-            'password_fields', 'hidden_iframes', 'external_action'
-        ])
+        # Create the feature dataframe
+        features_dict = {
+            'url_length': [url_length], 
+            'has_ip': [has_ip], 
+            'suspicious_tld': [suspicious_tld], 
+            'password_fields': [password_fields], 
+            'hidden_iframes': [hidden_iframes], 
+            'external_action': [external_action]
+        }
+        features = pd.DataFrame(features_dict)
 
-        # 2. Ask the model for the probability of class '1' (Phishing)
-        # predict_proba returns a nested array: [[prob_safe, prob_phishing]]
-        phishing_probability = self.model.predict_proba(features)[0][1]
+        # Get the standard probability score
+        prob = self.model.predict_proba(features)[0][1]
+        score = round(prob, 2)
         
-        score = round(phishing_probability, 2)
-        
-        # 3. Assign risk levels based on AI confidence
-        risk = "LOW"
+        # --- SHAP Explainability Engine ---
         indicators = []
-        
+        try:
+            # Calculate SHAP values for this specific website
+            shap_values = self.explainer.shap_values(features)
+            
+            # Identify the top 2 features that contributed most to the 'Phishing' score
+            feature_names = list(features_dict.keys())
+            # For XGBoost binary classification, shap_values is usually a 2D array
+            contributions = shap_values[0] if isinstance(shap_values, list) else shap_values[0]
+            
+            # Pair feature names with their mathematical SHAP contribution
+            feature_contributions = list(zip(feature_names, contributions))
+            
+            # Sort by the highest positive contribution to the phishing classification
+            feature_contributions.sort(key=lambda x: x[1], reverse=True)
+            
+            # Add the top 2 reasons to our indicators if they actually contributed to danger
+            for feat, impact in feature_contributions[:2]:
+                if impact > 0: # Only report it if it increased the danger score
+                    indicators.append(f"AI_Flagged_{feat.upper()}_(Impact: +{impact:.2f})")
+                    
+        except Exception as e:
+            print(f"SHAP Error: {e}")
+
+        # --- Risk Thresholds ---
+        risk = "LOW"
         if score >= 0.7:
             risk = "HIGH"
-            indicators.append(f"ai_high_confidence_({score})")
+            indicators.append(f"AI_High_Confidence_({score:.2f})")
         elif score >= 0.4:
             risk = "MEDIUM"
-            indicators.append(f"ai_medium_confidence_({score})")
+            indicators.append(f"AI_Medium_Confidence_({score:.2f})")
 
-        return {
-            "ml_score": score,
-            "risk": risk,
-            "indicators": indicators
-        }
-
-if __name__ == "__main__":
-    predictor = MLPredictor()
-    
-    # Test 1: Safe features (Short URL, no IP, no passwords, no hidden iframes)
-    print("Test 1 (Safe):", predictor.predict(url_length=30, has_ip=0, suspicious_tld=0, password_fields=0, hidden_iframes=0, external_action=0))
-    
-    # Test 2: Phishing features (Long URL, IP used, passwords requested, external action)
-    print("Test 2 (Phishing):", predictor.predict(url_length=120, has_ip=1, suspicious_tld=0, password_fields=1, hidden_iframes=2, external_action=1))
+        return {"ml_score": score, "risk": risk, "indicators": indicators}

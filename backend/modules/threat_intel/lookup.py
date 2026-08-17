@@ -1,50 +1,49 @@
-# lookup.py
-from .normalize import normalize_url
-from .database import check_indicator_in_db
-from .rules import check_brand_impersonation
+import whois
+import tldextract
+from datetime import datetime
 
-def analyze_url(raw_url: str) -> dict:
-    """
-    The main Threat Intelligence Engine. 
-    Combines database lookups with deterministic security rules.
-    """
-    norm_data = normalize_url(raw_url)
-    clean_url = norm_data["clean_url"]
-    domain = norm_data["domain"]
-    root_domain = norm_data["root_domain"]
-    
-    # 1. Database/Blocklist Lookup
-    is_url_blocked = check_indicator_in_db(clean_url)
-    is_domain_blocked = check_indicator_in_db(domain)
-    is_root_blocked = False
-    if domain != root_domain:
-        is_root_blocked = check_indicator_in_db(root_domain)
-
-    # 2. Hard Security Rules (Brand Impersonation)
-    is_impersonating = check_brand_impersonation(domain, root_domain)
-    
-    # 3. Determine Threat Score and Formatting
+def analyze_url(url):
     indicators = []
-    if is_url_blocked:
-        indicators.append("known_phishing_url")
-    if is_domain_blocked or is_root_blocked:
-        indicators.append("known_phishing_domain")
-    if is_impersonating:
-        indicators.append("brand_impersonation")
-        
-    matched = len(indicators) > 0
+    threat_score = 0.0
     
-    # Per blueprint: Blocklist matches or hard rules yield maximum threat score (1.0)
-    threat_score = 1.0 if matched else 0.0
+    # 1. Safely extract the root domain (e.g., getting 'paypal.com' from 'http://secure.login.paypal.com.xyz')
+    extracted = tldextract.extract(url)
+    domain = f"{extracted.domain}.{extracted.suffix}"
     
-    return {
-        "url_tested": raw_url,
-        "threat_score": threat_score,
-        "matched": matched,
-        "indicators": indicators
-    }
+    # Ignore local files or invalid URLs
+    if not extracted.suffix or domain == ".":
+        return {"threat_score": 0.0, "indicators": []}
 
-if __name__ == "__main__":
-    # Test cases
-    print("Test 1 (Safe):", analyze_url("https://paypal.com/login"))
-    print("Test 2 (Impersonation):", analyze_url("http://paypal-security-update.xyz"))
+    try:
+        # 2. Perform the live WHOIS lookup
+        domain_info = whois.whois(domain)
+        creation_date = domain_info.creation_date
+        
+        # WHOIS sometimes returns a list of dates if the domain was transferred; we grab the first one
+        if isinstance(creation_date, list):
+            creation_date = creation_date[0]
+            
+        if creation_date:
+            # 3. Calculate the exact age of the domain
+            days_old = (datetime.now() - creation_date).days
+            
+            # 4. Apply risk heuristics
+            if days_old < 30:
+                threat_score += 0.85
+                indicators.append(f"Recon_Alert:_Newly_Registered_Domain_({days_old}_days_old)")
+            elif days_old < 90:
+                threat_score += 0.40
+                indicators.append(f"Recon_Alert:_Recent_Domain_({days_old}_days_old)")
+        else:
+            threat_score += 0.30
+            indicators.append("Recon_Alert:_WHOIS_Creation_Date_Hidden")
+            
+    except Exception as e:
+        # If the lookup fails or the registry blocks us, it's slightly suspicious
+        threat_score += 0.0
+        indicators.append("Recon_Alert:_WHOIS_Lookup_Failed")
+
+    # Ensure the score never exceeds the maximum of 1.0
+    threat_score = min(threat_score, 1.0)
+    
+    return {"threat_score": round(threat_score, 2), "indicators": indicators}
